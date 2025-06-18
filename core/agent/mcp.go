@@ -186,12 +186,15 @@ func (a *Agent) initMCPActions() error {
 			options = append(options, transport.WithHTTPHeaders(headers))
 		}
 
-		// Create the HTTP client using the new library
-		mcpClient, err := client.NewStreamableHttpClient(mcpServer.URL, options...)
+		// Create HTTP transport directly (like in the example)
+		httpTransport, err := transport.NewStreamableHTTP(mcpServer.URL, options...)
 		if err != nil {
-			xlog.Error("Failed to create HTTP client", "server", mcpServer, "error", err.Error())
+			xlog.Error("Failed to create HTTP transport", "server", mcpServer, "error", err.Error())
 			continue
 		}
+
+		// Create client with the transport
+		mcpClient := client.NewClient(httpTransport)
 
 		// Start the client
 		if err := mcpClient.Start(a.context); err != nil {
@@ -218,12 +221,11 @@ func (a *Agent) initMCPActions() error {
 	for _, mcpStdioServer := range a.options.mcpStdioServers {
 		xlog.Debug("Adding tools for MCP STDIO server", "server", mcpStdioServer)
 
-		// Create the STDIO client using the new library
-		mcpClient, err := client.NewStdioMCPClient(mcpStdioServer.Cmd, mcpStdioServer.Env, mcpStdioServer.Args...)
-		if err != nil {
-			xlog.Error("Failed to create STDIO client", "server", mcpStdioServer, "error", err.Error())
-			continue
-		}
+		// Create STDIO transport directly with the command (like in the example)
+		stdioTransport := transport.NewStdio(mcpStdioServer.Cmd, mcpStdioServer.Env, mcpStdioServer.Args...)
+
+		// Create client with the transport
+		mcpClient := client.NewClient(stdioTransport)
 
 		// Start the client
 		if err := mcpClient.Start(a.context); err != nil {
