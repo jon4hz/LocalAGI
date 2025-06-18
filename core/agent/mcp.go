@@ -35,12 +35,14 @@ func (w *writeCloserWrapper) Close() error {
 	return nil
 }
 
-// MCPClient represents a cached MCP client
+// MCPClient represents a cached MCP client with its own context
 type MCPClient struct {
 	id          string
 	client      *client.Client
 	initialized bool
-	processID   string // For STDIO servers
+	processID   string             // For STDIO servers
+	ctx         context.Context    // Dedicated context for this client
+	cancelFunc  context.CancelFunc // Cancel function for client context
 	mutex       sync.RWMutex
 }
 
@@ -60,6 +62,20 @@ func (c *MCPClient) SetInitialized(initialized bool) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	c.initialized = initialized
+}
+
+func (c *MCPClient) GetContext() context.Context {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.ctx
+}
+
+func (c *MCPClient) Close() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.cancelFunc != nil {
+		c.cancelFunc()
+	}
 }
 
 // MCPClientManager manages persistent MCP clients
@@ -85,26 +101,36 @@ func (m *MCPClientManager) GetOrCreateClient(ctx context.Context, id string, ser
 		if mcpClient.IsInitialized() {
 			return mcpClient, nil
 		}
-		// If client exists but not initialized, remove it and recreate
+		// If client exists but not initialized, clean it up and recreate
+		mcpClient.Close()
 		delete(m.clients, id)
 	}
 
-	// Create new client
+	// Create dedicated context for this client based on agent context
+	clientCtx, cancelFunc := context.WithCancel(m.agent.context)
+
+	// Create new client with dedicated context
 	mcpClient := &MCPClient{
-		id: id,
+		id:         id,
+		ctx:        clientCtx,
+		cancelFunc: cancelFunc,
 	}
+
+	xlog.Debug("Created dedicated context for MCP client", "client", mcpClient.id, "context", fmt.Sprintf("%p", clientCtx))
 
 	var err error
 	switch config := serverConfig.(type) {
 	case MCPServer:
-		err = m.initHTTPClient(ctx, mcpClient, config)
+		err = m.initHTTPClient(mcpClient, config)
 	case MCPSTDIOServer:
-		err = m.initSTDIOClient(ctx, mcpClient, config)
+		err = m.initSTDIOClient(mcpClient, config)
 	default:
+		mcpClient.Close() // Clean up context if we can't initialize
 		return nil, fmt.Errorf("unsupported server config type: %T", serverConfig)
 	}
 
 	if err != nil {
+		mcpClient.Close() // Clean up context on error
 		return nil, fmt.Errorf("failed to initialize client %s: %w", id, err)
 	}
 
@@ -112,7 +138,7 @@ func (m *MCPClientManager) GetOrCreateClient(ctx context.Context, id string, ser
 	return mcpClient, nil
 }
 
-func (m *MCPClientManager) initHTTPClient(ctx context.Context, mcpClient *MCPClient, config MCPServer) error {
+func (m *MCPClientManager) initHTTPClient(mcpClient *MCPClient, config MCPServer) error {
 	// Create the HTTP client with headers
 	var mcpGOClient *client.Client
 	var err error
@@ -130,18 +156,18 @@ func (m *MCPClientManager) initHTTPClient(ctx context.Context, mcpClient *MCPCli
 		return fmt.Errorf("failed to create HTTP client: %w", err)
 	}
 
-	// Start the client
-	if err := mcpGOClient.Start(ctx); err != nil {
+	// Start the client with its dedicated context
+	if err := mcpGOClient.Start(mcpClient.ctx); err != nil {
 		return fmt.Errorf("failed to start HTTP client: %w", err)
 	}
 
 	mcpClient.client = mcpGOClient
-	return m.initializeClient(ctx, mcpClient)
+	return m.initializeClient(mcpClient)
 }
 
-func (m *MCPClientManager) initSTDIOClient(ctx context.Context, mcpClient *MCPClient, config MCPSTDIOServer) error {
+func (m *MCPClientManager) initSTDIOClient(mcpClient *MCPClient, config MCPSTDIOServer) error {
 	stdioClient := stdio.NewClient(m.agent.options.mcpBoxURL)
-	p, err := stdioClient.CreateProcess(ctx,
+	p, err := stdioClient.CreateProcess(mcpClient.ctx,
 		config.Cmd,
 		config.Args,
 		config.Env,
@@ -166,17 +192,17 @@ func (m *MCPClientManager) initSTDIOClient(ctx context.Context, mcpClient *MCPCl
 	// Create a new client using the transport
 	mcpGOClient := client.NewClient(stdioTransport)
 
-	// Start the client
-	if err := mcpGOClient.Start(ctx); err != nil {
+	// Start the client with its dedicated context
+	if err := mcpGOClient.Start(mcpClient.ctx); err != nil {
 		return fmt.Errorf("failed to start STDIO client: %w", err)
 	}
 
 	mcpClient.client = mcpGOClient
-	return m.initializeClient(ctx, mcpClient)
+	return m.initializeClient(mcpClient)
 }
 
-func (m *MCPClientManager) initializeClient(ctx context.Context, mcpClient *MCPClient) error {
-	// Initialize the client
+func (m *MCPClientManager) initializeClient(mcpClient *MCPClient) error {
+	// Initialize the client using its dedicated context
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
@@ -185,7 +211,7 @@ func (m *MCPClientManager) initializeClient(ctx context.Context, mcpClient *MCPC
 	}
 	initReq.Params.Capabilities = mcp.ClientCapabilities{}
 
-	response, err := mcpClient.client.Initialize(ctx, initReq)
+	response, err := mcpClient.client.Initialize(mcpClient.ctx, initReq)
 	if err != nil {
 		return fmt.Errorf("failed to initialize client: %w", err)
 	}
@@ -199,7 +225,9 @@ func (m *MCPClientManager) CleanupAll() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	for id := range m.clients {
+	for id, mcpClient := range m.clients {
+		// Close the client's dedicated context
+		mcpClient.Close()
 		delete(m.clients, id)
 	}
 
@@ -256,13 +284,16 @@ func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState
 		return types.ActionResult{}, fmt.Errorf("client not available for client %s", m.clientID)
 	}
 
+	// Use the client's dedicated context for the tool call
+	clientCtx := mcpClient.GetContext()
+
 	req := mcp.CallToolRequest{}
 	req.Params.Name = m.toolName
 	req.Params.Arguments = params
 
 	xlog.Debug("Calling MCP tool", "client", m.clientID, "tool", m.toolName, "params", params)
 
-	resp, err := client.CallTool(ctx, req)
+	resp, err := client.CallTool(clientCtx, req)
 	if err != nil {
 		xlog.Error("Failed to call tool", "error", err.Error(), "client", m.clientID, "tool", m.toolName)
 		return types.ActionResult{}, fmt.Errorf("failed to call tool %s: %w", m.toolName, err)
@@ -321,11 +352,14 @@ func (a *Agent) addTools(clientManager *MCPClientManager, clientID string) (type
 		return nil, fmt.Errorf("client not available for client %s", clientID)
 	}
 
+	// Use the client's dedicated context
+	clientCtx := mcpClient.GetContext()
+
 	xlog.Debug("Listing tools for client", "client", clientID)
 
-	// List tools
+	// List tools using the client's dedicated context
 	toolsReq := mcp.ListToolsRequest{}
-	toolsResult, err := client.ListTools(a.context, toolsReq)
+	toolsResult, err := client.ListTools(clientCtx, toolsReq)
 	if err != nil {
 		xlog.Error("Failed to list tools", "error", err.Error(), "client", clientID)
 		return nil, err
@@ -458,40 +492,4 @@ func (a *Agent) GetActiveMCPClients() map[string]bool {
 	}
 
 	return result
-}
-
-// SessionAwareHTTPTransport wraps the HTTP transport to handle session IDs
-type SessionAwareHTTPTransport struct {
-	baseTransport transport.Interface
-	sessionID     string
-	mutex         sync.RWMutex
-}
-
-func (t *SessionAwareHTTPTransport) SetSessionID(sessionID string) {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-	t.sessionID = sessionID
-}
-
-func (t *SessionAwareHTTPTransport) GetSessionID() string {
-	t.mutex.RLock()
-	defer t.mutex.RUnlock()
-	return t.sessionID
-}
-
-// Implement transport.Interface methods by delegating to baseTransport
-func (t *SessionAwareHTTPTransport) Start(ctx context.Context) error {
-	return t.baseTransport.Start(ctx)
-}
-
-func (t *SessionAwareHTTPTransport) Close() error {
-	return t.baseTransport.Close()
-}
-
-func (t *SessionAwareHTTPTransport) SendRequest(ctx context.Context, req transport.JSONRPCRequest) (*transport.JSONRPCResponse, error) {
-	return t.baseTransport.SendRequest(ctx, req)
-}
-
-func (t *SessionAwareHTTPTransport) SetNotificationHandler(handler func(mcp.JSONRPCNotification)) {
-	t.baseTransport.SetNotificationHandler(handler)
 }
