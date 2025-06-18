@@ -35,155 +35,111 @@ func (w *writeCloserWrapper) Close() error {
 	return nil
 }
 
-// MCPSession represents a persistent MCP client session
-type MCPSession struct {
-	id              string
-	client          *client.Client
-	initialized     bool
-	serverConfig    any    // Can be MCPServer or MCPSTDIOServer
-	sessionType     string // "http" or "stdio"
-	processID       string // For STDIO servers
-	serverSessionID string // Session ID returned by the MCP server (for HTTP sessions)
-	mutex           sync.RWMutex
+// MCPClient represents a cached MCP client
+type MCPClient struct {
+	id          string
+	client      *client.Client
+	initialized bool
+	processID   string // For STDIO servers
+	mutex       sync.RWMutex
 }
 
-func (s *MCPSession) SessionID() string {
-	return s.id
+func (c *MCPClient) GetClient() *client.Client {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.client
 }
 
-func (s *MCPSession) IsInitialized() bool {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	return s.initialized
+func (c *MCPClient) IsInitialized() bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.initialized
 }
 
-func (s *MCPSession) SetInitialized(initialized bool) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.initialized = initialized
+func (c *MCPClient) SetInitialized(initialized bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.initialized = initialized
 }
 
-func (s *MCPSession) GetClient() *client.Client {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	return s.client
+// MCPClientManager manages persistent MCP clients
+type MCPClientManager struct {
+	clients map[string]*MCPClient
+	mutex   sync.RWMutex
+	agent   *Agent
 }
 
-func (s *MCPSession) GetServerSessionID() string {
-	s.mutex.RLock()
-	defer s.mutex.RUnlock()
-	return s.serverSessionID
-}
-
-func (s *MCPSession) SetServerSessionID(sessionID string) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.serverSessionID = sessionID
-}
-
-// MCPSessionManager manages persistent MCP client sessions
-type MCPSessionManager struct {
-	sessions map[string]*MCPSession
-	mutex    sync.RWMutex
-	agent    *Agent
-}
-
-func NewMCPSessionManager(agent *Agent) *MCPSessionManager {
-	return &MCPSessionManager{
-		sessions: make(map[string]*MCPSession),
-		agent:    agent,
+func NewMCPClientManager(agent *Agent) *MCPClientManager {
+	return &MCPClientManager{
+		clients: make(map[string]*MCPClient),
+		agent:   agent,
 	}
 }
 
-func (m *MCPSessionManager) GetOrCreateSession(ctx context.Context, id string, serverConfig any) (*MCPSession, error) {
+func (m *MCPClientManager) GetOrCreateClient(ctx context.Context, id string, serverConfig interface{}) (*MCPClient, error) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	// Check if session already exists and is valid
-	if session, exists := m.sessions[id]; exists {
-		if session.IsInitialized() {
-			return session, nil
+	// Check if client already exists and is valid
+	if mcpClient, exists := m.clients[id]; exists {
+		if mcpClient.IsInitialized() {
+			return mcpClient, nil
 		}
-		// If session exists but not initialized, remove it and recreate
-		m.removeSessionUnsafe(id)
+		// If client exists but not initialized, remove it and recreate
+		delete(m.clients, id)
 	}
 
-	// Create new session
-	session := &MCPSession{
-		id:           id,
-		serverConfig: serverConfig,
+	// Create new client
+	mcpClient := &MCPClient{
+		id: id,
 	}
 
 	var err error
 	switch config := serverConfig.(type) {
 	case MCPServer:
-		session.sessionType = "http"
-		err = m.initHTTPSession(ctx, session, config)
+		err = m.initHTTPClient(ctx, mcpClient, config)
 	case MCPSTDIOServer:
-		session.sessionType = "stdio"
-		err = m.initSTDIOSession(ctx, session, config)
+		err = m.initSTDIOClient(ctx, mcpClient, config)
 	default:
 		return nil, fmt.Errorf("unsupported server config type: %T", serverConfig)
 	}
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize session %s: %w", id, err)
+		return nil, fmt.Errorf("failed to initialize client %s: %w", id, err)
 	}
 
-	m.sessions[id] = session
-	return session, nil
+	m.clients[id] = mcpClient
+	return mcpClient, nil
 }
 
-func (m *MCPSessionManager) initHTTPSession(ctx context.Context, session *MCPSession, config MCPServer) error {
-	// Build headers for the HTTP client
-	headers := make(map[string]string)
-
-	// Add authorization header if token is provided
-	if config.Token != "" {
-		headers["Authorization"] = "Bearer " + config.Token
-	}
-
-	// If we already have a server session ID (reconnecting), include it
-	if session.GetServerSessionID() != "" {
-		headers["mcp-session-id"] = session.GetServerSessionID()
-		xlog.Debug("Using existing session ID", "session", session.id, "server_session", session.GetServerSessionID())
-	}
-
+func (m *MCPClientManager) initHTTPClient(ctx context.Context, mcpClient *MCPClient, config MCPServer) error {
 	// Create the HTTP client with headers
-	mcpClient, err := client.NewStreamableHttpClient(config.URL,
-		transport.WithHTTPHeaders(headers))
+	var mcpGOClient *client.Client
+	var err error
+
+	if config.Token != "" {
+		mcpGOClient, err = client.NewStreamableHttpClient(config.URL,
+			transport.WithHTTPHeaders(map[string]string{
+				"Authorization": "Bearer " + config.Token,
+			}))
+	} else {
+		mcpGOClient, err = client.NewStreamableHttpClient(config.URL)
+	}
 
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP client: %w", err)
 	}
 
 	// Start the client
-	if err := mcpClient.Start(ctx); err != nil {
+	if err := mcpGOClient.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start HTTP client: %w", err)
 	}
 
-	session.client = mcpClient
-
-	// Initialize the client and try to capture session info
-	err = m.initializeClient(ctx, session)
-	if err != nil {
-		return err
-	}
-
-	// After successful initialization, try to extract session information if available
-	// For now, we'll use a simple approach: if this is the first time connecting,
-	// generate a session ID that we can use for future connections
-	if session.GetServerSessionID() == "" {
-		// Use our internal session ID as the server session ID
-		// This assumes the server will accept this pattern
-		session.SetServerSessionID(session.id)
-		xlog.Debug("Generated server session ID", "session", session.id, "server_session", session.id)
-	}
-
-	return nil
+	mcpClient.client = mcpGOClient
+	return m.initializeClient(ctx, mcpClient)
 }
 
-func (m *MCPSessionManager) initSTDIOSession(ctx context.Context, session *MCPSession, config MCPSTDIOServer) error {
+func (m *MCPClientManager) initSTDIOClient(ctx context.Context, mcpClient *MCPClient, config MCPSTDIOServer) error {
 	stdioClient := stdio.NewClient(m.agent.options.mcpBoxURL)
 	p, err := stdioClient.CreateProcess(ctx,
 		config.Cmd,
@@ -194,7 +150,7 @@ func (m *MCPSessionManager) initSTDIOSession(ctx context.Context, session *MCPSe
 		return fmt.Errorf("failed to create process: %w", err)
 	}
 
-	session.processID = p.ID
+	mcpClient.processID = p.ID
 
 	read, writer, err := stdioClient.GetProcessIO(p.ID)
 	if err != nil {
@@ -208,18 +164,18 @@ func (m *MCPSessionManager) initSTDIOSession(ctx context.Context, session *MCPSe
 	stdioTransport := transport.NewIO(read, writeCloser, nil)
 
 	// Create a new client using the transport
-	mcpClient := client.NewClient(stdioTransport)
+	mcpGOClient := client.NewClient(stdioTransport)
 
 	// Start the client
-	if err := mcpClient.Start(ctx); err != nil {
+	if err := mcpGOClient.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start STDIO client: %w", err)
 	}
 
-	session.client = mcpClient
-	return m.initializeClient(ctx, session)
+	mcpClient.client = mcpGOClient
+	return m.initializeClient(ctx, mcpClient)
 }
 
-func (m *MCPSessionManager) initializeClient(ctx context.Context, session *MCPSession) error {
+func (m *MCPClientManager) initializeClient(ctx context.Context, mcpClient *MCPClient) error {
 	// Initialize the client
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
@@ -229,38 +185,22 @@ func (m *MCPSessionManager) initializeClient(ctx context.Context, session *MCPSe
 	}
 	initReq.Params.Capabilities = mcp.ClientCapabilities{}
 
-	response, err := session.client.Initialize(ctx, initReq)
+	response, err := mcpClient.client.Initialize(ctx, initReq)
 	if err != nil {
 		return fmt.Errorf("failed to initialize client: %w", err)
 	}
 
-	xlog.Debug("Client initialized", "session", session.id, "server", response.ServerInfo.Name)
-	session.SetInitialized(true)
+	xlog.Debug("Client initialized", "client", mcpClient.id, "server", response.ServerInfo.Name)
+	mcpClient.SetInitialized(true)
 	return nil
 }
 
-func (m *MCPSessionManager) RemoveSession(id string) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.removeSessionUnsafe(id)
-}
-
-func (m *MCPSessionManager) removeSessionUnsafe(id string) {
-	if session, exists := m.sessions[id]; exists {
-		// Clean up STDIO process if needed
-		if session.sessionType == "stdio" && session.processID != "" {
-			// STDIO processes will be cleaned up by the group cleanup in CleanupAll
-		}
-		delete(m.sessions, id)
-	}
-}
-
-func (m *MCPSessionManager) CleanupAll() {
+func (m *MCPClientManager) CleanupAll() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	for id := range m.sessions {
-		m.removeSessionUnsafe(id)
+	for id := range m.clients {
+		delete(m.clients, id)
 	}
 
 	// Stop all STDIO processes for this character
@@ -270,37 +210,11 @@ func (m *MCPSessionManager) CleanupAll() {
 	}
 }
 
-func (m *MCPSessionManager) GetSession(id string) (*MCPSession, bool) {
+func (m *MCPClientManager) GetClient(id string) (*MCPClient, bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
-	session, exists := m.sessions[id]
-	return session, exists
-}
-
-// CheckSessionHealth verifies if a session is still healthy and responsive
-func (m *MCPSessionManager) CheckSessionHealth(ctx context.Context, sessionID string) error {
-	session, exists := m.GetSession(sessionID)
-	if !exists {
-		return fmt.Errorf("session %s not found", sessionID)
-	}
-
-	if !session.IsInitialized() {
-		return fmt.Errorf("session %s not initialized", sessionID)
-	}
-
-	client := session.GetClient()
-	if client == nil {
-		return fmt.Errorf("session %s has no client", sessionID)
-	}
-
-	// Try to list tools as a health check
-	toolsReq := mcp.ListToolsRequest{}
-	_, err := client.ListTools(ctx, toolsReq)
-	if err != nil {
-		return fmt.Errorf("session %s health check failed: %w", sessionID, err)
-	}
-
-	return nil
+	mcpClient, exists := m.clients[id]
+	return mcpClient, exists
 }
 
 var _ types.Action = &mcpAction{}
@@ -317,8 +231,8 @@ type MCPSTDIOServer struct {
 }
 
 type mcpAction struct {
-	sessionManager  *MCPSessionManager
-	sessionID       string
+	clientManager   *MCPClientManager
+	clientID        string
 	inputSchema     ToolInputSchema
 	toolName        string
 	toolDescription string
@@ -329,38 +243,32 @@ func (a *mcpAction) Plannable() bool {
 }
 
 func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState, params types.ActionParams) (types.ActionResult, error) {
-	// Get the session
-	session, exists := m.sessionManager.GetSession(m.sessionID)
-	if !exists || !session.IsInitialized() {
-		xlog.Error("Session not found or not initialized", "session", m.sessionID, "tool", m.toolName)
-		return types.ActionResult{}, fmt.Errorf("session %s not found or not initialized", m.sessionID)
+	// Get the client
+	mcpClient, exists := m.clientManager.GetClient(m.clientID)
+	if !exists || !mcpClient.IsInitialized() {
+		xlog.Error("Client not found or not initialized", "client", m.clientID, "tool", m.toolName)
+		return types.ActionResult{}, fmt.Errorf("client %s not found or not initialized", m.clientID)
 	}
 
-	client := session.GetClient()
+	client := mcpClient.GetClient()
 	if client == nil {
-		xlog.Error("Client not available", "session", m.sessionID, "tool", m.toolName)
-		return types.ActionResult{}, fmt.Errorf("client not available for session %s", m.sessionID)
+		xlog.Error("Client not available", "client", m.clientID, "tool", m.toolName)
+		return types.ActionResult{}, fmt.Errorf("client not available for client %s", m.clientID)
 	}
 
 	req := mcp.CallToolRequest{}
 	req.Params.Name = m.toolName
 	req.Params.Arguments = params
 
-	xlog.Debug("Calling MCP tool", "session", m.sessionID, "tool", m.toolName, "params", params)
+	xlog.Debug("Calling MCP tool", "client", m.clientID, "tool", m.toolName, "params", params)
 
 	resp, err := client.CallTool(ctx, req)
 	if err != nil {
-		xlog.Error("Failed to call tool", "error", err.Error(), "session", m.sessionID, "tool", m.toolName)
-
-		// Check if this might be a session issue and try to recreate the session
-		if healthErr := m.sessionManager.CheckSessionHealth(ctx, m.sessionID); healthErr != nil {
-			xlog.Warn("Session health check failed, session may need refresh", "session", m.sessionID, "health_error", healthErr.Error())
-		}
-
+		xlog.Error("Failed to call tool", "error", err.Error(), "client", m.clientID, "tool", m.toolName)
 		return types.ActionResult{}, fmt.Errorf("failed to call tool %s: %w", m.toolName, err)
 	}
 
-	xlog.Debug("MCP response", "response", resp, "session", m.sessionID, "tool", m.toolName)
+	xlog.Debug("MCP response", "response", resp, "client", m.clientID, "tool", m.toolName)
 
 	textResult := ""
 	for _, c := range resp.Content {
@@ -400,26 +308,26 @@ type ToolInputSchema struct {
 	Required   []string       `json:"required,omitempty"`
 }
 
-func (a *Agent) addTools(sessionManager *MCPSessionManager, sessionID string) (types.Actions, error) {
+func (a *Agent) addTools(clientManager *MCPClientManager, clientID string) (types.Actions, error) {
 	var generatedActions types.Actions
 
-	session, exists := sessionManager.GetSession(sessionID)
-	if !exists || !session.IsInitialized() {
-		return nil, fmt.Errorf("session %s not found or not initialized", sessionID)
+	mcpClient, exists := clientManager.GetClient(clientID)
+	if !exists || !mcpClient.IsInitialized() {
+		return nil, fmt.Errorf("client %s not found or not initialized", clientID)
 	}
 
-	mcpClient := session.GetClient()
-	if mcpClient == nil {
-		return nil, fmt.Errorf("client not available for session %s", sessionID)
+	client := mcpClient.GetClient()
+	if client == nil {
+		return nil, fmt.Errorf("client not available for client %s", clientID)
 	}
 
-	xlog.Debug("Listing tools for session", "session", sessionID)
+	xlog.Debug("Listing tools for client", "client", clientID)
 
 	// List tools
 	toolsReq := mcp.ListToolsRequest{}
-	toolsResult, err := mcpClient.ListTools(a.context, toolsReq)
+	toolsResult, err := client.ListTools(a.context, toolsReq)
 	if err != nil {
-		xlog.Error("Failed to list tools", "error", err.Error(), "session", sessionID)
+		xlog.Error("Failed to list tools", "error", err.Error(), "client", clientID)
 		return nil, err
 	}
 
@@ -429,7 +337,7 @@ func (a *Agent) addTools(sessionManager *MCPSessionManager, sessionID string) (t
 			desc = t.Description
 		}
 
-		xlog.Debug("Tool", "name", t.Name, "description", desc, "session", sessionID)
+		xlog.Debug("Tool", "name", t.Name, "description", desc, "client", clientID)
 
 		dat, err := json.Marshal(t.InputSchema)
 		if err != nil {
@@ -445,10 +353,10 @@ func (a *Agent) addTools(sessionManager *MCPSessionManager, sessionID string) (t
 			xlog.Error("Failed to unmarshal input schema", "error", err.Error())
 		}
 
-		// Create a new action with session manager + session ID + tool
+		// Create a new action with client manager + client ID + tool
 		generatedActions = append(generatedActions, &mcpAction{
-			sessionManager:  sessionManager,
-			sessionID:       sessionID,
+			clientManager:   clientManager,
+			clientID:        clientID,
 			toolName:        t.Name,
 			inputSchema:     inputSchema,
 			toolDescription: desc,
@@ -473,16 +381,16 @@ func (a *Agent) initMCPActions() error {
 
 	// MCP HTTP Servers
 	for i, mcpServer := range a.options.mcpServers {
-		sessionID := fmt.Sprintf("http-%d-%s", i, mcpServer.URL)
+		clientID := fmt.Sprintf("http-%d-%s", i, mcpServer.URL)
 
-		_, err := a.mcpSessionManager.GetOrCreateSession(a.context, sessionID, mcpServer)
+		_, err := a.mcpClientManager.GetOrCreateClient(a.context, clientID, mcpServer)
 		if err != nil {
-			xlog.Error("Failed to create HTTP session", "server", mcpServer, "error", err.Error())
+			xlog.Error("Failed to create HTTP client", "server", mcpServer, "error", err.Error())
 			continue
 		}
 
-		xlog.Debug("Adding tools for MCP HTTP server", "server", mcpServer, "session", sessionID)
-		actions, err := a.addTools(a.mcpSessionManager, sessionID)
+		xlog.Debug("Adding tools for MCP HTTP server", "server", mcpServer, "client", clientID)
+		actions, err := a.addTools(a.mcpClientManager, clientID)
 		if err != nil {
 			xlog.Error("Failed to add tools for MCP HTTP server", "server", mcpServer, "error", err.Error())
 			continue
@@ -492,16 +400,16 @@ func (a *Agent) initMCPActions() error {
 
 	// MCP STDIO Servers
 	for i, mcpStdioServer := range a.options.mcpStdioServers {
-		sessionID := fmt.Sprintf("stdio-%d-%s", i, mcpStdioServer.Cmd)
+		clientID := fmt.Sprintf("stdio-%d-%s", i, mcpStdioServer.Cmd)
 
-		_, err := a.mcpSessionManager.GetOrCreateSession(a.context, sessionID, mcpStdioServer)
+		_, err := a.mcpClientManager.GetOrCreateClient(a.context, clientID, mcpStdioServer)
 		if err != nil {
-			xlog.Error("Failed to create STDIO session", "server", mcpStdioServer, "error", err.Error())
+			xlog.Error("Failed to create STDIO client", "server", mcpStdioServer, "error", err.Error())
 			continue
 		}
 
-		xlog.Debug("Adding tools for MCP STDIO server", "server", mcpStdioServer, "session", sessionID)
-		actions, err := a.addTools(a.mcpSessionManager, sessionID)
+		xlog.Debug("Adding tools for MCP STDIO server", "server", mcpStdioServer, "client", clientID)
+		actions, err := a.addTools(a.mcpClientManager, clientID)
 		if err != nil {
 			xlog.Error("Failed to add tools for MCP STDIO server", "server", mcpStdioServer, "error", err.Error())
 			continue
@@ -514,39 +422,39 @@ func (a *Agent) initMCPActions() error {
 }
 
 func (a *Agent) closeMCPSTDIOServers() {
-	if a.mcpSessionManager != nil {
-		a.mcpSessionManager.CleanupAll()
+	if a.mcpClientManager != nil {
+		a.mcpClientManager.CleanupAll()
 	}
 }
 
-// RefreshMCPSessions refreshes all MCP sessions and reinitializes actions
-func (a *Agent) RefreshMCPSessions() error {
+// RefreshMCPClients refreshes all MCP clients and reinitializes actions
+func (a *Agent) RefreshMCPClients() error {
 	a.Lock()
 	defer a.Unlock()
 
-	xlog.Debug("Refreshing MCP sessions", "agent", a.Character.Name)
+	xlog.Debug("Refreshing MCP clients", "agent", a.Character.Name)
 
-	// Clean up existing sessions
-	if a.mcpSessionManager != nil {
-		a.mcpSessionManager.CleanupAll()
+	// Clean up existing clients
+	if a.mcpClientManager != nil {
+		a.mcpClientManager.CleanupAll()
 	}
 
-	// Reinitialize MCP actions which will create new sessions
+	// Reinitialize MCP actions which will create new clients
 	return a.initMCPActions()
 }
 
-// GetActiveMCPSessions returns information about active MCP sessions
-func (a *Agent) GetActiveMCPSessions() map[string]bool {
-	if a.mcpSessionManager == nil {
+// GetActiveMCPClients returns information about active MCP clients
+func (a *Agent) GetActiveMCPClients() map[string]bool {
+	if a.mcpClientManager == nil {
 		return make(map[string]bool)
 	}
 
-	a.mcpSessionManager.mutex.RLock()
-	defer a.mcpSessionManager.mutex.RUnlock()
+	a.mcpClientManager.mutex.RLock()
+	defer a.mcpClientManager.mutex.RUnlock()
 
 	result := make(map[string]bool)
-	for id, session := range a.mcpSessionManager.sessions {
-		result[id] = session.IsInitialized()
+	for id, mcpClient := range a.mcpClientManager.clients {
+		result[id] = mcpClient.IsInitialized()
 	}
 
 	return result
