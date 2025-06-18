@@ -3,16 +3,35 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"io"
 
-	mcp "github.com/metoro-io/mcp-golang"
-	"github.com/metoro-io/mcp-golang/transport/http"
-	stdioTransport "github.com/metoro-io/mcp-golang/transport/stdio"
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mudler/LocalAGI/core/types"
 	"github.com/mudler/LocalAGI/pkg/stdio"
 	"github.com/mudler/LocalAGI/pkg/xlog"
 
 	"github.com/sashabaranov/go-openai/jsonschema"
 )
+
+// writeCloserWrapper wraps an io.Writer to implement io.WriteCloser
+type writeCloserWrapper struct {
+	writer io.Writer
+}
+
+func (w *writeCloserWrapper) Write(p []byte) (n int, err error) {
+	return w.writer.Write(p)
+}
+
+func (w *writeCloserWrapper) Close() error {
+	// If the underlying writer has a Close method, call it
+	if closer, ok := w.writer.(io.Closer); ok {
+		return closer.Close()
+	}
+	// Otherwise, do nothing
+	return nil
+}
 
 var _ types.Action = &mcpAction{}
 
@@ -28,7 +47,7 @@ type MCPSTDIOServer struct {
 }
 
 type mcpAction struct {
-	mcpClient       *mcp.Client
+	mcpClient       *client.Client
 	inputSchema     ToolInputSchema
 	toolName        string
 	toolDescription string
@@ -39,7 +58,14 @@ func (a *mcpAction) Plannable() bool {
 }
 
 func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState, params types.ActionParams) (types.ActionResult, error) {
-	resp, err := m.mcpClient.CallTool(ctx, m.toolName, params)
+	req := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      m.toolName,
+			Arguments: params,
+		},
+	}
+
+	resp, err := m.mcpClient.CallTool(ctx, req)
 	if err != nil {
 		xlog.Error("Failed to call tool", "error", err.Error())
 		return types.ActionResult{}, err
@@ -49,13 +75,12 @@ func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState
 
 	textResult := ""
 	for _, c := range resp.Content {
-		switch c.Type {
-		case mcp.ContentTypeText:
-			textResult += c.TextContent.Text + "\n"
-		case mcp.ContentTypeImage:
+		if textContent, ok := mcp.AsTextContent(c); ok {
+			textResult += textContent.Text + "\n"
+		} else if _, ok := mcp.AsImageContent(c); ok {
 			xlog.Error("Image content not supported yet")
-		case mcp.ContentTypeEmbeddedResource:
-			xlog.Error("Embedded resource content not supported yet")
+		} else if _, ok := mcp.AsEmbeddedResource(c); ok {
+			xlog.Error("Resource content not supported yet")
 		}
 	}
 
@@ -76,8 +101,7 @@ func (m *mcpAction) Definition() types.ActionDefinition {
 		Name:        types.ActionDefinitionName(m.toolName),
 		Description: m.toolDescription,
 		Required:    m.inputSchema.Required,
-		//Properties:  ,
-		Properties: props,
+		Properties:  props,
 	}
 }
 
@@ -87,70 +111,73 @@ type ToolInputSchema struct {
 	Required   []string               `json:"required,omitempty"`
 }
 
-func (a *Agent) addTools(client *mcp.Client) (types.Actions, error) {
-
+func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 	var generatedActions types.Actions
 	xlog.Debug("Initializing client")
+
 	// Initialize the client
-	response, e := client.Initialize(a.context)
-	if e != nil {
-		xlog.Error("Failed to initialize client", "error", e.Error())
-		return nil, e
+	initReq := mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo: mcp.Implementation{
+				Name:    "LocalAGI",
+				Version: "1.0.0",
+			},
+			Capabilities: mcp.ClientCapabilities{},
+		},
 	}
 
-	xlog.Debug("Client initialized: %v", response.Instructions)
+	response, err := mcpClient.Initialize(a.context, initReq)
+	if err != nil {
+		xlog.Error("Failed to initialize client", "error", err.Error())
+		return nil, err
+	}
 
-	var cursor *string
-	for {
-		tools, err := client.ListTools(a.context, cursor)
+	xlog.Debug("Client initialized", "server", response.ServerInfo.Name)
+
+	// List tools
+	toolsReq := mcp.ListToolsRequest{}
+	toolsResult, err := mcpClient.ListTools(a.context, toolsReq)
+	if err != nil {
+		xlog.Error("Failed to list tools", "error", err.Error())
+		return nil, err
+	}
+
+	for _, t := range toolsResult.Tools {
+		desc := ""
+		if t.Description != "" {
+			desc = t.Description
+		}
+
+		xlog.Debug("Tool", "name", t.Name, "description", desc)
+
+		dat, err := json.Marshal(t.InputSchema)
 		if err != nil {
-			xlog.Error("Failed to list tools", "error", err.Error())
-			return nil, err
+			xlog.Error("Failed to marshal input schema", "error", err.Error())
 		}
 
-		for _, t := range tools.Tools {
-			desc := ""
-			if t.Description != nil {
-				desc = *t.Description
-			}
+		xlog.Debug("Input schema", "tool", t.Name, "schema", string(dat))
 
-			xlog.Debug("Tool", "name", t.Name, "description", desc)
-
-			dat, err := json.Marshal(t.InputSchema)
-			if err != nil {
-				xlog.Error("Failed to marshal input schema", "error", err.Error())
-			}
-
-			xlog.Debug("Input schema", "tool", t.Name, "schema", string(dat))
-
-			// XXX: This is a wild guess, to verify (data types might be incompatible)
-			var inputSchema ToolInputSchema
-			err = json.Unmarshal(dat, &inputSchema)
-			if err != nil {
-				xlog.Error("Failed to unmarshal input schema", "error", err.Error())
-			}
-
-			// Create a new action with Client + tool
-			generatedActions = append(generatedActions, &mcpAction{
-				mcpClient:       client,
-				toolName:        t.Name,
-				inputSchema:     inputSchema,
-				toolDescription: desc,
-			})
+		// Convert the input schema
+		var inputSchema ToolInputSchema
+		err = json.Unmarshal(dat, &inputSchema)
+		if err != nil {
+			xlog.Error("Failed to unmarshal input schema", "error", err.Error())
 		}
 
-		if tools.NextCursor == nil {
-			break // No more pages
-		}
-		cursor = tools.NextCursor
+		// Create a new action with Client + tool
+		generatedActions = append(generatedActions, &mcpAction{
+			mcpClient:       mcpClient,
+			toolName:        t.Name,
+			inputSchema:     inputSchema,
+			toolDescription: desc,
+		})
 	}
 
 	return generatedActions, nil
-
 }
 
 func (a *Agent) initMCPActions() error {
-
 	a.mcpActions = nil
 	var err error
 
@@ -158,16 +185,35 @@ func (a *Agent) initMCPActions() error {
 
 	// MCP HTTP Servers
 	for _, mcpServer := range a.options.mcpServers {
-		transport := http.NewHTTPClientTransport("/mcp")
-		transport.WithBaseURL(mcpServer.URL)
+		// Create StreamableHTTP transport
+		httpTransport, err := transport.NewStreamableHTTP(mcpServer.URL)
+		if err != nil {
+			xlog.Error("Failed to create HTTP transport", "server", mcpServer, "error", err.Error())
+			continue
+		}
+
 		if mcpServer.Token != "" {
-			transport.WithHeader("Authorization", "Bearer "+mcpServer.Token)
+			httpTransport, err = transport.NewStreamableHTTP(mcpServer.URL,
+				transport.WithHTTPHeaders(map[string]string{
+					"Authorization": "Bearer " + mcpServer.Token,
+				}))
+			if err != nil {
+				xlog.Error("Failed to create HTTP transport with auth", "server", mcpServer, "error", err.Error())
+				continue
+			}
 		}
 
 		// Create a new client
-		client := mcp.NewClient(transport)
+		mcpClient := client.NewClient(httpTransport)
+
+		// Start the client
+		if err := mcpClient.Start(a.context); err != nil {
+			xlog.Error("Failed to start HTTP client", "server", mcpServer, "error", err.Error())
+			continue
+		}
+
 		xlog.Debug("Adding tools for MCP server", "server", mcpServer)
-		actions, err := a.addTools(client)
+		actions, err := a.addTools(mcpClient)
 		if err != nil {
 			xlog.Error("Failed to add tools for MCP server", "server", mcpServer, "error", err.Error())
 		}
@@ -175,18 +221,17 @@ func (a *Agent) initMCPActions() error {
 	}
 
 	// MCP STDIO Servers
-
 	a.closeMCPSTDIOServers() // Make sure we stop all previous servers if any is active
 
 	if a.options.mcpPrepareScript != "" {
 		xlog.Debug("Preparing MCP box", "script", a.options.mcpPrepareScript)
-		client := stdio.NewClient(a.options.mcpBoxURL)
-		client.RunProcess(a.context, "/bin/bash", []string{"-c", a.options.mcpPrepareScript}, []string{})
+		stdioClient := stdio.NewClient(a.options.mcpBoxURL)
+		stdioClient.RunProcess(a.context, "/bin/bash", []string{"-c", a.options.mcpPrepareScript}, []string{})
 	}
 
 	for _, mcpStdioServer := range a.options.mcpStdioServers {
-		client := stdio.NewClient(a.options.mcpBoxURL)
-		p, err := client.CreateProcess(a.context,
+		stdioClient := stdio.NewClient(a.options.mcpBoxURL)
+		p, err := stdioClient.CreateProcess(a.context,
 			mcpStdioServer.Cmd,
 			mcpStdioServer.Args,
 			mcpStdioServer.Env,
@@ -195,16 +240,26 @@ func (a *Agent) initMCPActions() error {
 			xlog.Error("Failed to create process", "error", err.Error())
 			continue
 		}
-		read, writer, err := client.GetProcessIO(p.ID)
+		read, writer, err := stdioClient.GetProcessIO(p.ID)
 		if err != nil {
 			xlog.Error("Failed to get process IO", "error", err.Error())
 			continue
 		}
 
-		transport := stdioTransport.NewStdioServerTransportWithIO(read, writer)
+		// Create a WriteCloser wrapper for the writer
+		writeCloser := &writeCloserWrapper{writer: writer}
+
+		// Create STDIO transport using NewIO
+		stdioTransport := transport.NewIO(read, writeCloser, nil)
 
 		// Create a new client
-		mcpClient := mcp.NewClient(transport)
+		mcpClient := client.NewClient(stdioTransport)
+
+		// Start the client
+		if err := mcpClient.Start(a.context); err != nil {
+			xlog.Error("Failed to start STDIO client", "server", mcpStdioServer, "error", err.Error())
+			continue
+		}
 
 		xlog.Debug("Adding tools for MCP server (stdio)", "server", mcpStdioServer)
 		actions, err := a.addTools(mcpClient)
@@ -220,6 +275,6 @@ func (a *Agent) initMCPActions() error {
 }
 
 func (a *Agent) closeMCPSTDIOServers() {
-	client := stdio.NewClient(a.options.mcpBoxURL)
-	client.StopGroup(a.Character.Name)
+	stdioClient := stdio.NewClient(a.options.mcpBoxURL)
+	stdioClient.StopGroup(a.Character.Name)
 }
