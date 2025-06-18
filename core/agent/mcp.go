@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
@@ -58,6 +60,12 @@ func (a *mcpAction) Plannable() bool {
 }
 
 func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState, params types.ActionParams) (types.ActionResult, error) {
+	// Check client health before making the call
+	if err := m.checkMCPClientHealth(ctx); err != nil {
+		xlog.Error("MCP client health check failed", "tool", m.toolName, "error", err.Error())
+		return types.ActionResult{}, err
+	}
+
 	req := mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
 			Name:      m.toolName,
@@ -65,9 +73,30 @@ func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState
 		},
 	}
 
-	resp, err := m.mcpClient.CallTool(ctx, req)
+	const maxRetries = 3
+	var resp *mcp.CallToolResult
+	var err error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		resp, err = m.mcpClient.CallTool(ctx, req)
+		if err == nil {
+			break
+		}
+		
+		// Check if this is a session terminated error that can be retried
+		if strings.Contains(err.Error(), "session terminated") || strings.Contains(err.Error(), "404") {
+			xlog.Warn("MCP tool call failed, retrying", "tool", m.toolName, "attempt", attempt+1, "error", err)
+			if attempt < maxRetries-1 {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+			}
+		} else {
+			// For other errors, don't retry
+			break
+		}
+	}
+
 	if err != nil {
-		xlog.Error("Failed to call tool", "error", err.Error())
+		xlog.Error("Failed to call tool after retries", "tool", m.toolName, "error", err.Error())
 		return types.ActionResult{}, err
 	}
 
@@ -115,7 +144,7 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 	var generatedActions types.Actions
 	xlog.Debug("Initializing client")
 
-	// Initialize the client
+	// Initialize the client with retry logic
 	initReq := mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
 			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
@@ -127,9 +156,30 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 		},
 	}
 
-	response, err := mcpClient.Initialize(a.context, initReq)
+	const maxRetries = 3
+	var response *mcp.InitializeResult
+	var err error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		response, err = mcpClient.Initialize(a.context, initReq)
+		if err == nil {
+			break
+		}
+		
+		// Check if this is a session terminated error that can be retried
+		if strings.Contains(err.Error(), "session terminated") || strings.Contains(err.Error(), "404") {
+			xlog.Warn("MCP client initialization failed, retrying", "attempt", attempt+1, "error", err)
+			if attempt < maxRetries-1 {
+				time.Sleep(time.Duration(attempt+1) * time.Second) // Exponential backoff
+			}
+		} else {
+			// For other errors, don't retry
+			break
+		}
+	}
+
 	if err != nil {
-		xlog.Error("Failed to initialize client", "error", err.Error())
+		xlog.Error("Failed to initialize client after retries", "error", err.Error())
 		return nil, err
 	}
 
@@ -206,9 +256,27 @@ func (a *Agent) initMCPActions() error {
 		// Create a new client
 		mcpClient := client.NewClient(httpTransport)
 
-		// Start the client
-		if err := mcpClient.Start(a.context); err != nil {
-			xlog.Error("Failed to start HTTP client", "server", mcpServer, "error", err.Error())
+		// Start the client with retry logic
+		const maxStartRetries = 3
+		var startErr error
+		for attempt := 0; attempt < maxStartRetries; attempt++ {
+			startErr = mcpClient.Start(a.context)
+			if startErr == nil {
+				break
+			}
+			
+			if strings.Contains(startErr.Error(), "session terminated") || strings.Contains(startErr.Error(), "404") {
+				xlog.Warn("MCP HTTP client start failed, retrying", "attempt", attempt+1, "server", mcpServer, "error", startErr)
+				if attempt < maxStartRetries-1 {
+					time.Sleep(time.Duration(attempt+1) * time.Second)
+				}
+			} else {
+				break
+			}
+		}
+
+		if startErr != nil {
+			xlog.Error("Failed to start HTTP client after retries", "server", mcpServer, "error", startErr.Error())
 			continue
 		}
 
@@ -255,9 +323,27 @@ func (a *Agent) initMCPActions() error {
 		// Create a new client
 		mcpClient := client.NewClient(stdioTransport)
 
-		// Start the client
-		if err := mcpClient.Start(a.context); err != nil {
-			xlog.Error("Failed to start STDIO client", "server", mcpStdioServer, "error", err.Error())
+		// Start the client with retry logic
+		const maxStartRetries = 3
+		var startErr error
+		for attempt := 0; attempt < maxStartRetries; attempt++ {
+			startErr = mcpClient.Start(a.context)
+			if startErr == nil {
+				break
+			}
+			
+			if strings.Contains(startErr.Error(), "session terminated") || strings.Contains(startErr.Error(), "404") {
+				xlog.Warn("MCP STDIO client start failed, retrying", "attempt", attempt+1, "server", mcpStdioServer, "error", startErr)
+				if attempt < maxStartRetries-1 {
+					time.Sleep(time.Duration(attempt+1) * time.Second)
+				}
+			} else {
+				break
+			}
+		}
+
+		if startErr != nil {
+			xlog.Error("Failed to start STDIO client after retries", "server", mcpStdioServer, "error", startErr.Error())
 			continue
 		}
 
@@ -277,4 +363,50 @@ func (a *Agent) initMCPActions() error {
 func (a *Agent) closeMCPSTDIOServers() {
 	stdioClient := stdio.NewClient(a.options.mcpBoxURL)
 	stdioClient.StopGroup(a.Character.Name)
+}
+
+// checkMCPClientHealth checks if the MCP client connection is still healthy
+// and attempts to reinitialize if needed
+func (m *mcpAction) checkMCPClientHealth(ctx context.Context) error {
+	// Try a simple ListTools call to check if the connection is still active
+	toolsReq := mcp.ListToolsRequest{}
+	_, err := m.mcpClient.ListTools(ctx, toolsReq)
+	
+	if err != nil && (strings.Contains(err.Error(), "session terminated") || strings.Contains(err.Error(), "404")) {
+		xlog.Warn("MCP client connection unhealthy, reinitializing", "error", err)
+		
+		// Attempt to reinitialize the client
+		initReq := mcp.InitializeRequest{
+			Params: mcp.InitializeParams{
+				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+				ClientInfo: mcp.Implementation{
+					Name:    "LocalAGI",
+					Version: "1.0.0",
+				},
+				Capabilities: mcp.ClientCapabilities{},
+			},
+		}
+		
+		const maxRetries = 3
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			_, reinitErr := m.mcpClient.Initialize(ctx, initReq)
+			if reinitErr == nil {
+				xlog.Info("MCP client successfully reinitialized")
+				return nil
+			}
+			
+			if strings.Contains(reinitErr.Error(), "session terminated") || strings.Contains(reinitErr.Error(), "404") {
+				xlog.Warn("MCP client reinitialize failed, retrying", "attempt", attempt+1, "error", reinitErr)
+				if attempt < maxRetries-1 {
+					time.Sleep(time.Duration(attempt+1) * time.Second)
+				}
+			} else {
+				return reinitErr
+			}
+		}
+		
+		return err
+	}
+	
+	return err
 }
