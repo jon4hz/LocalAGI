@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 
-	mcp "github.com/metoro-io/mcp-golang"
-	"github.com/metoro-io/mcp-golang/transport/http"
-	stdioTransport "github.com/metoro-io/mcp-golang/transport/stdio"
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mudler/LocalAGI/core/types"
 	"github.com/mudler/LocalAGI/pkg/stdio"
 	"github.com/mudler/LocalAGI/pkg/xlog"
@@ -28,7 +28,7 @@ type MCPSTDIOServer struct {
 }
 
 type mcpAction struct {
-	mcpClient       *mcp.Client
+	mcpClient       *client.Client
 	inputSchema     ToolInputSchema
 	toolName        string
 	toolDescription string
@@ -39,7 +39,21 @@ func (a *mcpAction) Plannable() bool {
 }
 
 func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState, params types.ActionParams) (types.ActionResult, error) {
-	resp, err := m.mcpClient.CallTool(ctx, m.toolName, params)
+	// Convert params to the expected format for the new library
+	toolParams := make(map[string]interface{})
+	for k, v := range params {
+		toolParams[k] = v
+	}
+
+	// Create the tool call request
+	toolRequest := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name:      m.toolName,
+			Arguments: toolParams,
+		},
+	}
+
+	resp, err := m.mcpClient.CallTool(ctx, toolRequest)
 	if err != nil {
 		xlog.Error("Failed to call tool", "error", err.Error())
 		return types.ActionResult{}, err
@@ -49,13 +63,11 @@ func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState
 
 	textResult := ""
 	for _, c := range resp.Content {
-		switch c.Type {
-		case mcp.ContentTypeText:
-			textResult += c.TextContent.Text + "\n"
-		case mcp.ContentTypeImage:
-			xlog.Error("Image content not supported yet")
-		case mcp.ContentTypeEmbeddedResource:
-			xlog.Error("Embedded resource content not supported yet")
+		// Try to cast to TextContent
+		if textContent, ok := mcp.AsTextContent(c); ok {
+			textResult += textContent.Text + "\n"
+		} else {
+			xlog.Debug("Non-text content received", "content", c)
 		}
 	}
 
@@ -87,62 +99,67 @@ type ToolInputSchema struct {
 	Required   []string               `json:"required,omitempty"`
 }
 
-func (a *Agent) addTools(client *mcp.Client) (types.Actions, error) {
+func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 
 	var generatedActions types.Actions
 	xlog.Debug("Initializing client")
+
 	// Initialize the client
-	response, e := client.Initialize(a.context)
-	if e != nil {
-		xlog.Error("Failed to initialize client", "error", e.Error())
-		return nil, e
+	initRequest := mcp.InitializeRequest{}
+	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initRequest.Params.ClientInfo = mcp.Implementation{
+		Name:    "LocalAGI MCP Client",
+		Version: "1.0.0",
+	}
+	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
+
+	response, err := mcpClient.Initialize(context.Background(), initRequest)
+	if err != nil {
+		xlog.Error("Failed to initialize client", "error", err.Error())
+		return nil, err
 	}
 
-	xlog.Debug("Client initialized: %v", response.Instructions)
+	xlog.Debug("Client initialized", "serverInfo", response.ServerInfo)
 
-	var cursor *string
-	for {
-		tools, err := client.ListTools(a.context, cursor)
+	// List all tools (the new library handles pagination internally)
+	toolsRequest := mcp.ListToolsRequest{}
+	toolsResult, err := mcpClient.ListTools(context.Background(), toolsRequest)
+	if err != nil {
+		xlog.Error("Failed to list tools", "error", err.Error())
+		return nil, err
+	}
+
+	for _, t := range toolsResult.Tools {
+		desc := ""
+		if t.Description != "" {
+			desc = t.Description
+		}
+
+		xlog.Debug("Tool", "name", t.Name, "description", desc)
+
+		dat, err := json.Marshal(t.InputSchema)
 		if err != nil {
-			xlog.Error("Failed to list tools", "error", err.Error())
-			return nil, err
+			xlog.Error("Failed to marshal input schema", "error", err.Error())
+			continue
 		}
 
-		for _, t := range tools.Tools {
-			desc := ""
-			if t.Description != nil {
-				desc = *t.Description
-			}
+		xlog.Debug("Input schema", "tool", t.Name, "schema", string(dat))
 
-			xlog.Debug("Tool", "name", t.Name, "description", desc)
-
-			dat, err := json.Marshal(t.InputSchema)
-			if err != nil {
-				xlog.Error("Failed to marshal input schema", "error", err.Error())
-			}
-
-			xlog.Debug("Input schema", "tool", t.Name, "schema", string(dat))
-
-			// XXX: This is a wild guess, to verify (data types might be incompatible)
-			var inputSchema ToolInputSchema
-			err = json.Unmarshal(dat, &inputSchema)
-			if err != nil {
-				xlog.Error("Failed to unmarshal input schema", "error", err.Error())
-			}
-
-			// Create a new action with Client + tool
-			generatedActions = append(generatedActions, &mcpAction{
-				mcpClient:       client,
-				toolName:        t.Name,
-				inputSchema:     inputSchema,
-				toolDescription: desc,
-			})
+		// Convert the schema to our internal format
+		var inputSchema ToolInputSchema
+		err = json.Unmarshal(dat, &inputSchema)
+		if err != nil {
+			xlog.Error("Failed to unmarshal input schema", "error", err.Error())
+			continue
 		}
 
-		if tools.NextCursor == nil {
-			break // No more pages
-		}
-		cursor = tools.NextCursor
+		// Create a new action with Client + tool
+		generatedActions = append(generatedActions, &mcpAction{
+			mcpClient:       mcpClient,
+			toolName:        t.Name,
+			inputSchema:     inputSchema,
+			toolDescription: desc,
+		})
 	}
 
 	return generatedActions, nil
@@ -158,16 +175,34 @@ func (a *Agent) initMCPActions() error {
 
 	// MCP HTTP Servers
 	for _, mcpServer := range a.options.mcpServers {
-		transport := http.NewHTTPClientTransport("/mcp")
-		transport.WithBaseURL(mcpServer.URL)
+		xlog.Debug("Adding tools for MCP HTTP server", "server", mcpServer)
+
+		// Create HTTP transport options
+		var options []transport.StreamableHTTPCOption
 		if mcpServer.Token != "" {
-			transport.WithHeader("Authorization", "Bearer "+mcpServer.Token)
+			headers := map[string]string{
+				"Authorization": "Bearer " + mcpServer.Token,
+			}
+			options = append(options, transport.WithHTTPHeaders(headers))
 		}
 
-		// Create a new client
-		client := mcp.NewClient(transport)
-		xlog.Debug("Adding tools for MCP server", "server", mcpServer)
-		actions, err := a.addTools(client)
+		// Create HTTP transport directly (like in the example)
+		httpTransport, err := transport.NewStreamableHTTP(mcpServer.URL, options...)
+		if err != nil {
+			xlog.Error("Failed to create HTTP transport", "server", mcpServer, "error", err.Error())
+			continue
+		}
+
+		// Create client with the transport
+		mcpClient := client.NewClient(httpTransport)
+
+		// Start the client
+		if err := mcpClient.Start(context.Background()); err != nil {
+			xlog.Error("Failed to start HTTP client", "server", mcpServer, "error", err.Error())
+			continue
+		}
+
+		actions, err := a.addTools(mcpClient)
 		if err != nil {
 			xlog.Error("Failed to add tools for MCP server", "server", mcpServer, "error", err.Error())
 		}
@@ -175,38 +210,29 @@ func (a *Agent) initMCPActions() error {
 	}
 
 	// MCP STDIO Servers
-
 	a.closeMCPSTDIOServers() // Make sure we stop all previous servers if any is active
 
 	if a.options.mcpPrepareScript != "" {
 		xlog.Debug("Preparing MCP box", "script", a.options.mcpPrepareScript)
 		client := stdio.NewClient(a.options.mcpBoxURL)
-		client.RunProcess(a.context, "/bin/bash", []string{"-c", a.options.mcpPrepareScript}, []string{})
+		client.RunProcess(context.Background(), "/bin/bash", []string{"-c", a.options.mcpPrepareScript}, []string{})
 	}
 
 	for _, mcpStdioServer := range a.options.mcpStdioServers {
-		client := stdio.NewClient(a.options.mcpBoxURL)
-		p, err := client.CreateProcess(a.context,
-			mcpStdioServer.Cmd,
-			mcpStdioServer.Args,
-			mcpStdioServer.Env,
-			a.Character.Name)
-		if err != nil {
-			xlog.Error("Failed to create process", "error", err.Error())
+		xlog.Debug("Adding tools for MCP STDIO server", "server", mcpStdioServer)
+
+		// Create STDIO transport directly with the command (like in the example)
+		stdioTransport := transport.NewStdio(mcpStdioServer.Cmd, mcpStdioServer.Env, mcpStdioServer.Args...)
+
+		// Create client with the transport
+		mcpClient := client.NewClient(stdioTransport)
+
+		// Start the client
+		if err := mcpClient.Start(context.Background()); err != nil {
+			xlog.Error("Failed to start STDIO client", "server", mcpStdioServer, "error", err.Error())
 			continue
 		}
-		read, writer, err := client.GetProcessIO(p.ID)
-		if err != nil {
-			xlog.Error("Failed to get process IO", "error", err.Error())
-			continue
-		}
 
-		transport := stdioTransport.NewStdioServerTransportWithIO(read, writer)
-
-		// Create a new client
-		mcpClient := mcp.NewClient(transport)
-
-		xlog.Debug("Adding tools for MCP server (stdio)", "server", mcpStdioServer)
 		actions, err := a.addTools(mcpClient)
 		if err != nil {
 			xlog.Error("Failed to add tools for MCP server", "server", mcpStdioServer, "error", err.Error())

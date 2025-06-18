@@ -2,14 +2,34 @@ package stdio
 
 import (
 	"context"
+	"io"
 	"time"
 
-	mcp "github.com/metoro-io/mcp-golang"
-	"github.com/metoro-io/mcp-golang/transport/stdio"
+	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mudler/LocalAGI/pkg/xlog"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
+
+// writeCloserWrapper wraps an io.Writer to implement io.WriteCloser
+type writeCloserWrapper struct {
+	writer io.Writer
+}
+
+func (w *writeCloserWrapper) Write(p []byte) (n int, err error) {
+	return w.writer.Write(p)
+}
+
+func (w *writeCloserWrapper) Close() error {
+	// If the underlying writer has a Close method, call it
+	if closer, ok := w.writer.(io.Closer); ok {
+		return closer.Close()
+	}
+	// Otherwise, do nothing
+	return nil
+}
 
 var _ = Describe("Client", func() {
 	var (
@@ -199,12 +219,32 @@ var _ = Describe("Client", func() {
 			Expect(read).NotTo(BeNil())
 			Expect(writer).NotTo(BeNil())
 
-			transport := stdio.NewStdioServerTransportWithIO(read, writer)
+			// Create a WriteCloser wrapper for the writer
+			writeCloser := &writeCloserWrapper{writer: writer}
 
-			// Create a new client
-			mcpClient := mcp.NewClient(transport)
+			// Create STDIO transport using NewIO
+			stdioTransport := transport.NewIO(read, writeCloser, nil)
+
+			// Create a new MCP client
+			mcpClient := mcpclient.NewClient(stdioTransport)
+
+			// Start the client
+			err = mcpClient.Start(ctx)
+			Expect(err).NotTo(HaveOccurred())
+
 			// Initialize the client
-			response, e := mcpClient.Initialize(ctx)
+			initRequest := mcp.InitializeRequest{
+				Params: mcp.InitializeParams{
+					ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+					ClientInfo: mcp.Implementation{
+						Name:    "LocalAGI-Test",
+						Version: "1.0.0",
+					},
+					Capabilities: mcp.ClientCapabilities{},
+				},
+			}
+
+			response, e := mcpClient.Initialize(ctx, initRequest)
 			Expect(e).NotTo(HaveOccurred())
 			Expect(response).NotTo(BeNil())
 
@@ -212,19 +252,29 @@ var _ = Describe("Client", func() {
 
 			xlog.Debug("Client initialized: %v", response.Instructions)
 
-			alltools := []mcp.ToolRetType{}
-			var cursor *string
+			alltools := []mcp.Tool{}
+			var cursor mcp.Cursor
 			for {
-				tools, err := mcpClient.ListTools(ctx, cursor)
+				toolsRequest := mcp.ListToolsRequest{
+					PaginatedRequest: mcp.PaginatedRequest{
+						Params: mcp.PaginatedParams{
+							Cursor: cursor,
+						},
+					},
+				}
+				toolsResult, err := mcpClient.ListTools(ctx, toolsRequest)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(tools).NotTo(BeNil())
-				Expect(tools.Tools).NotTo(BeEmpty())
-				alltools = append(alltools, tools.Tools...)
+				Expect(toolsResult).NotTo(BeNil())
 
-				if tools.NextCursor == nil {
+				if len(toolsResult.Tools) == 0 {
+					break
+				}
+				alltools = append(alltools, toolsResult.Tools...)
+
+				if toolsResult.NextCursor == "" {
 					break // No more pages
 				}
-				cursor = tools.NextCursor
+				cursor = toolsResult.NextCursor
 			}
 
 			for _, tool := range alltools {
