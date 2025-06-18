@@ -37,13 +37,14 @@ func (w *writeCloserWrapper) Close() error {
 
 // MCPSession represents a persistent MCP client session
 type MCPSession struct {
-	id           string
-	client       *client.Client
-	initialized  bool
-	serverConfig any    // Can be MCPServer or MCPSTDIOServer
-	sessionType  string // "http" or "stdio"
-	processID    string // For STDIO servers
-	mutex        sync.RWMutex
+	id              string
+	client          *client.Client
+	initialized     bool
+	serverConfig    any    // Can be MCPServer or MCPSTDIOServer
+	sessionType     string // "http" or "stdio"
+	processID       string // For STDIO servers
+	serverSessionID string // Session ID returned by the MCP server (for HTTP sessions)
+	mutex           sync.RWMutex
 }
 
 func (s *MCPSession) SessionID() string {
@@ -66,6 +67,18 @@ func (s *MCPSession) GetClient() *client.Client {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 	return s.client
+}
+
+func (s *MCPSession) GetServerSessionID() string {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.serverSessionID
+}
+
+func (s *MCPSession) SetServerSessionID(sessionID string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.serverSessionID = sessionID
 }
 
 // MCPSessionManager manages persistent MCP client sessions
@@ -122,17 +135,23 @@ func (m *MCPSessionManager) GetOrCreateSession(ctx context.Context, id string, s
 }
 
 func (m *MCPSessionManager) initHTTPSession(ctx context.Context, session *MCPSession, config MCPServer) error {
-	var mcpClient *client.Client
-	var err error
+	// Build headers for the HTTP client
+	headers := make(map[string]string)
 
+	// Add authorization header if token is provided
 	if config.Token != "" {
-		mcpClient, err = client.NewStreamableHttpClient(config.URL,
-			transport.WithHTTPHeaders(map[string]string{
-				"Authorization": "Bearer " + config.Token,
-			}))
-	} else {
-		mcpClient, err = client.NewStreamableHttpClient(config.URL)
+		headers["Authorization"] = "Bearer " + config.Token
 	}
+
+	// If we already have a server session ID (reconnecting), include it
+	if session.GetServerSessionID() != "" {
+		headers["mcp-session-id"] = session.GetServerSessionID()
+		xlog.Debug("Using existing session ID", "session", session.id, "server_session", session.GetServerSessionID())
+	}
+
+	// Create the HTTP client with headers
+	mcpClient, err := client.NewStreamableHttpClient(config.URL,
+		transport.WithHTTPHeaders(headers))
 
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP client: %w", err)
@@ -144,7 +163,24 @@ func (m *MCPSessionManager) initHTTPSession(ctx context.Context, session *MCPSes
 	}
 
 	session.client = mcpClient
-	return m.initializeClient(ctx, session)
+
+	// Initialize the client and try to capture session info
+	err = m.initializeClient(ctx, session)
+	if err != nil {
+		return err
+	}
+
+	// After successful initialization, try to extract session information if available
+	// For now, we'll use a simple approach: if this is the first time connecting,
+	// generate a session ID that we can use for future connections
+	if session.GetServerSessionID() == "" {
+		// Use our internal session ID as the server session ID
+		// This assumes the server will accept this pattern
+		session.SetServerSessionID(session.id)
+		xlog.Debug("Generated server session ID", "session", session.id, "server_session", session.id)
+	}
+
+	return nil
 }
 
 func (m *MCPSessionManager) initSTDIOSession(ctx context.Context, session *MCPSession, config MCPSTDIOServer) error {
@@ -514,4 +550,40 @@ func (a *Agent) GetActiveMCPSessions() map[string]bool {
 	}
 
 	return result
+}
+
+// SessionAwareHTTPTransport wraps the HTTP transport to handle session IDs
+type SessionAwareHTTPTransport struct {
+	baseTransport transport.Interface
+	sessionID     string
+	mutex         sync.RWMutex
+}
+
+func (t *SessionAwareHTTPTransport) SetSessionID(sessionID string) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	t.sessionID = sessionID
+}
+
+func (t *SessionAwareHTTPTransport) GetSessionID() string {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	return t.sessionID
+}
+
+// Implement transport.Interface methods by delegating to baseTransport
+func (t *SessionAwareHTTPTransport) Start(ctx context.Context) error {
+	return t.baseTransport.Start(ctx)
+}
+
+func (t *SessionAwareHTTPTransport) Close() error {
+	return t.baseTransport.Close()
+}
+
+func (t *SessionAwareHTTPTransport) SendRequest(ctx context.Context, req transport.JSONRPCRequest) (*transport.JSONRPCResponse, error) {
+	return t.baseTransport.SendRequest(ctx, req)
+}
+
+func (t *SessionAwareHTTPTransport) SetNotificationHandler(handler func(mcp.JSONRPCNotification)) {
+	t.baseTransport.SetNotificationHandler(handler)
 }
