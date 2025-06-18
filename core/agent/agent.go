@@ -41,7 +41,8 @@ type Agent struct {
 
 	newConversations chan openai.ChatCompletionMessage
 
-	mcpActions types.Actions
+	mcpActions        types.Actions
+	mcpSessionManager *MCPSessionManager
 
 	subscriberMutex        sync.Mutex
 	newMessagesSubscribers []func(openai.ChatCompletionMessage)
@@ -83,6 +84,9 @@ func New(opts ...Option) (*Agent, error) {
 		newMessagesSubscribers: options.newConversationsSubscribers,
 		sharedState:            types.NewAgentSharedState(options.lastMessageDuration),
 	}
+
+	// Initialize MCP session manager
+	a.mcpSessionManager = NewMCPSessionManager(a)
 
 	// Initialize observer if provided
 	if options.observer != nil {
