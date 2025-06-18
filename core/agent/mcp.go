@@ -64,11 +64,11 @@ func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState
 
 	resp, err := m.mcpClient.CallTool(ctx, req)
 	if err != nil {
-		xlog.Error("Failed to call tool", "error", err.Error())
+		xlog.Error("Failed to call tool", "tool", m.toolName, "error", err.Error())
 		return types.ActionResult{}, err
 	}
 
-	xlog.Debug("MCP response", "response", resp)
+	xlog.Debug("MCP response", "tool", m.toolName, "response", resp)
 
 	textResult := ""
 	for _, c := range resp.Content {
@@ -127,7 +127,7 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 		return nil, err
 	}
 
-	xlog.Debug("Client initialized", "server", response.ServerInfo.Name)
+	xlog.Debug("Client initialized", "server", response.ServerInfo.Name, "version", response.ServerInfo.Version)
 
 	// List tools
 	toolsReq := mcp.ListToolsRequest{}
@@ -136,6 +136,8 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 		xlog.Error("Failed to list tools", "error", err.Error())
 		return nil, err
 	}
+
+	xlog.Debug("Found tools", "count", len(toolsResult.Tools))
 
 	for _, t := range toolsResult.Tools {
 		desc := ""
@@ -148,6 +150,7 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 		dat, err := json.Marshal(t.InputSchema)
 		if err != nil {
 			xlog.Error("Failed to marshal input schema", "error", err.Error())
+			continue
 		}
 
 		xlog.Debug("Input schema", "tool", t.Name, "schema", string(dat))
@@ -157,6 +160,7 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 		err = json.Unmarshal(dat, &inputSchema)
 		if err != nil {
 			xlog.Error("Failed to unmarshal input schema", "error", err.Error())
+			continue
 		}
 
 		// Create a new action with Client + tool
@@ -173,6 +177,10 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 
 func (a *Agent) initMCPActions() error {
 	a.mcpActions = nil
+
+	// Close any existing MCP clients first
+	a.closeMCPClients()
+
 	var err error
 
 	generatedActions := types.Actions{}
@@ -202,10 +210,18 @@ func (a *Agent) initMCPActions() error {
 			continue
 		}
 
+		// Set up notification handler
+		mcpClient.OnNotification(func(notification mcp.JSONRPCNotification) {
+			xlog.Debug("Received MCP notification", "method", notification.Method, "params", notification.Params)
+		})
+
 		xlog.Debug("Adding tools for MCP server", "server", mcpServer)
 		actions, err := a.addTools(mcpClient)
 		if err != nil {
 			xlog.Error("Failed to add tools for MCP server", "server", mcpServer, "error", err.Error())
+			// Close the client on error
+			mcpClient.Close()
+			continue
 		}
 		generatedActions = append(generatedActions, actions...)
 	}
@@ -251,6 +267,11 @@ func (a *Agent) initMCPActions() error {
 			continue
 		}
 
+		// Set up notification handler
+		mcpClient.OnNotification(func(notification mcp.JSONRPCNotification) {
+			xlog.Debug("Received MCP notification", "method", notification.Method, "params", notification.Params)
+		})
+
 		xlog.Debug("Adding tools for MCP server (stdio)", "server", mcpStdioServer)
 		actions, err := a.addTools(mcpClient)
 		if err != nil {
@@ -267,4 +288,17 @@ func (a *Agent) initMCPActions() error {
 func (a *Agent) closeMCPSTDIOServers() {
 	stdioClient := stdio.NewClient(a.options.mcpBoxURL)
 	stdioClient.StopGroup(a.Character.Name)
+}
+
+func (a *Agent) closeMCPClients() {
+	// Close existing MCP action clients
+	if a.mcpActions != nil {
+		for _, action := range a.mcpActions {
+			if mcpAction, ok := action.(*mcpAction); ok {
+				if mcpAction.mcpClient != nil {
+					mcpAction.mcpClient.Close()
+				}
+			}
+		}
+	}
 }
