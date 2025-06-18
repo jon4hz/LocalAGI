@@ -58,12 +58,9 @@ func (a *mcpAction) Plannable() bool {
 }
 
 func (m *mcpAction) Run(ctx context.Context, sharedState *types.AgentSharedState, params types.ActionParams) (types.ActionResult, error) {
-	req := mcp.CallToolRequest{
-		Params: mcp.CallToolParams{
-			Name:      m.toolName,
-			Arguments: params,
-		},
-	}
+	req := mcp.CallToolRequest{}
+	req.Params.Name = m.toolName
+	req.Params.Arguments = params
 
 	resp, err := m.mcpClient.CallTool(ctx, req)
 	if err != nil {
@@ -116,16 +113,13 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 	xlog.Debug("Initializing client")
 
 	// Initialize the client
-	initReq := mcp.InitializeRequest{
-		Params: mcp.InitializeParams{
-			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-			ClientInfo: mcp.Implementation{
-				Name:    "LocalAGI",
-				Version: "1.0.0",
-			},
-			Capabilities: mcp.ClientCapabilities{},
-		},
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{
+		Name:    "LocalAGI",
+		Version: "1.0.0",
 	}
+	initReq.Params.Capabilities = mcp.ClientCapabilities{}
 
 	response, err := mcpClient.Initialize(a.context, initReq)
 	if err != nil {
@@ -185,26 +179,22 @@ func (a *Agent) initMCPActions() error {
 
 	// MCP HTTP Servers
 	for _, mcpServer := range a.options.mcpServers {
-		// Create StreamableHTTP transport
-		httpTransport, err := transport.NewStreamableHTTP(mcpServer.URL)
-		if err != nil {
-			xlog.Error("Failed to create HTTP transport", "server", mcpServer, "error", err.Error())
-			continue
-		}
+		// Create StreamableHTTP client using the convenience method
+		var mcpClient *client.Client
 
 		if mcpServer.Token != "" {
-			httpTransport, err = transport.NewStreamableHTTP(mcpServer.URL,
+			mcpClient, err = client.NewStreamableHttpClient(mcpServer.URL,
 				transport.WithHTTPHeaders(map[string]string{
 					"Authorization": "Bearer " + mcpServer.Token,
 				}))
-			if err != nil {
-				xlog.Error("Failed to create HTTP transport with auth", "server", mcpServer, "error", err.Error())
-				continue
-			}
+		} else {
+			mcpClient, err = client.NewStreamableHttpClient(mcpServer.URL)
 		}
 
-		// Create a new client
-		mcpClient := client.NewClient(httpTransport)
+		if err != nil {
+			xlog.Error("Failed to create HTTP client", "server", mcpServer, "error", err.Error())
+			continue
+		}
 
 		// Start the client
 		if err := mcpClient.Start(a.context); err != nil {
@@ -252,7 +242,7 @@ func (a *Agent) initMCPActions() error {
 		// Create STDIO transport using NewIO
 		stdioTransport := transport.NewIO(read, writeCloser, nil)
 
-		// Create a new client
+		// Create a new client using the transport
 		mcpClient := client.NewClient(stdioTransport)
 
 		// Start the client
