@@ -113,7 +113,7 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 	}
 	initRequest.Params.Capabilities = mcp.ClientCapabilities{}
 
-	response, err := mcpClient.Initialize(a.context, initRequest)
+	response, err := mcpClient.Initialize(context.Background(), initRequest)
 	if err != nil {
 		xlog.Error("Failed to initialize client", "error", err.Error())
 		return nil, err
@@ -123,7 +123,7 @@ func (a *Agent) addTools(mcpClient *client.Client) (types.Actions, error) {
 
 	// List all tools (the new library handles pagination internally)
 	toolsRequest := mcp.ListToolsRequest{}
-	toolsResult, err := mcpClient.ListTools(a.context, toolsRequest)
+	toolsResult, err := mcpClient.ListTools(context.Background(), toolsRequest)
 	if err != nil {
 		xlog.Error("Failed to list tools", "error", err.Error())
 		return nil, err
@@ -197,7 +197,7 @@ func (a *Agent) initMCPActions() error {
 		mcpClient := client.NewClient(httpTransport)
 
 		// Start the client
-		if err := mcpClient.Start(a.context); err != nil {
+		if err := mcpClient.Start(context.Background()); err != nil {
 			xlog.Error("Failed to start HTTP client", "server", mcpServer, "error", err.Error())
 			continue
 		}
@@ -215,7 +215,7 @@ func (a *Agent) initMCPActions() error {
 	if a.options.mcpPrepareScript != "" {
 		xlog.Debug("Preparing MCP box", "script", a.options.mcpPrepareScript)
 		client := stdio.NewClient(a.options.mcpBoxURL)
-		client.RunProcess(a.context, "/bin/bash", []string{"-c", a.options.mcpPrepareScript}, []string{})
+		client.RunProcess(context.Background(), "/bin/bash", []string{"-c", a.options.mcpPrepareScript}, []string{})
 	}
 
 	for _, mcpStdioServer := range a.options.mcpStdioServers {
@@ -228,7 +228,7 @@ func (a *Agent) initMCPActions() error {
 		mcpClient := client.NewClient(stdioTransport)
 
 		// Start the client
-		if err := mcpClient.Start(a.context); err != nil {
+		if err := mcpClient.Start(context.Background()); err != nil {
 			xlog.Error("Failed to start STDIO client", "server", mcpStdioServer, "error", err.Error())
 			continue
 		}
